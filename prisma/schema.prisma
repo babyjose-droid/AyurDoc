@@ -1,0 +1,632 @@
+// AyurCare — Prisma Schema v1.0 (Phase 1: Foundation)
+// Multi-tenant: Clinic is the root entity. clinic_id scopes every record.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  SUPER_ADMIN
+  CLINIC_ADMIN
+  DOCTOR
+  STAFF
+}
+
+enum DoctorStatus {
+  PENDING // uploaded docs, awaiting Super Admin review
+  VERIFIED // approved — can issue prescriptions
+  REJECTED // rejected with reason
+  SUSPENDED // suspended by Super Admin
+}
+
+enum ClinicStatus {
+  ACTIVE
+  SUSPENDED
+  LAPSED // subscription expired
+}
+
+enum SubscriptionTier {
+  SOLO // 1 doctor, up to 500 patients/month
+  CLINIC // up to 5 doctors, up to 2000 patients/month
+  MULTI_CENTER // unlimited doctors, custom limits
+}
+
+// ─── Clinic ──────────────────────────────────────────────────────────────────
+
+model Clinic {
+  id                 String           @id @default(uuid())
+  clinicId           String           @unique // AYR-XXXXX — human-readable login key
+  name               String
+  addressLine1       String
+  addressLine2       String?
+  city               String
+  state              String
+  pincode            String
+  phone              String
+  email              String
+  logoUrl            String? // S3 key for clinic logo
+  status             ClinicStatus     @default(ACTIVE)
+  tier               SubscriptionTier @default(SOLO)
+  subscriptionExpiry DateTime?
+  workingHours       Json? // { mon: "9:00-18:00", tue: "9:00-18:00", ... }
+  consultationTypes  String[] // ["General OPD", "Panchakarma", "Follow-up"]
+  gstNumber          String?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  // Relations
+  doctors  Doctor[]
+  staff    Staff[]
+  patients Patient[]
+  Visit    Visit[]
+
+  @@map("clinics")
+}
+
+// ─── Doctor ──────────────────────────────────────────────────────────────────
+
+model Doctor {
+  id                 String       @id @default(uuid())
+  clinicId           String
+  name               String
+  mobile             String // login credential
+  email              String?
+  qualification      String // e.g. "BAMS, MD (Ayurveda)"
+  specialization     String?
+  yearsExperience    Int?
+  registrationNumber String // State Ayurveda Board / CCIM number
+  registrationState  String? // e.g. "Kerala", "Karnataka"
+  status             DoctorStatus @default(PENDING)
+  rejectionReason    String?
+  signatureUrl       String? // S3 key for doctor's signature/stamp image
+  consultationFee    Decimal?     @db.Decimal(10, 2)
+  isActive           Boolean      @default(true)
+  verifiedAt         DateTime?
+  verifiedByAdminId  String?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  // Relations
+  clinic       Clinic        @relation(fields: [clinicId], references: [id])
+  certificates Certificate[]
+  Visit        Visit[]
+
+  @@unique([clinicId, mobile]) // one mobile per clinic context
+  @@map("doctors")
+}
+
+// ─── Staff ───────────────────────────────────────────────────────────────────
+
+model Staff {
+  id        String   @id @default(uuid())
+  clinicId  String
+  name      String
+  mobile    String
+  email     String?
+  role      UserRole @default(STAFF) // CLINIC_ADMIN or STAFF
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clinic Clinic @relation(fields: [clinicId], references: [id])
+
+  @@unique([clinicId, mobile])
+  @@map("staff")
+}
+
+// ─── Certificate ─────────────────────────────────────────────────────────────
+
+model Certificate {
+  id         String   @id @default(uuid())
+  doctorId   String
+  type       String // "DEGREE" | "REGISTRATION" | "OTHER"
+  fileName   String
+  s3Key      String // S3 object key
+  mimeType   String
+  uploadedAt DateTime @default(now())
+
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@map("certificates")
+}
+
+// ─── Patient (Phase 1 — basic registration, full detail Phase 2) ─────────────
+
+model Patient {
+  id             String          @id @default(uuid())
+  clinicId       String
+  patientCode    String // clinic-scoped sequential code e.g. "SRD-0042"
+  name           String
+  mobile         String?
+  email          String?
+  dateOfBirth    DateTime?
+  gender         String? // "M" | "F" | "OTHER"
+  address        String?
+  occupation     String?
+  isActive       Boolean         @default(true)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  Clinic         Clinic          @relation(fields: [clinicId], references: [id])
+  Visit          Visit[]
+  MedicalHistory MedicalHistory?
+  LabReport      LabReport[]
+
+  @@unique([clinicId, patientCode])
+  @@map("patients")
+}
+
+// ─── Session (login audit) ────────────────────────────────────────────────────
+
+model Session {
+  id         String    @id @default(uuid())
+  clinicId   String
+  userId     String // doctorId or staffId
+  userRole   UserRole
+  deviceInfo String?
+  ipAddress  String?
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  revokedAt  DateTime?
+
+  @@map("sessions")
+}
+
+// ─── OTP Store (managed in Redis, this is audit/fallback) ────────────────────
+
+model OtpLog {
+  id          String    @id @default(uuid())
+  clinicId    String
+  mobile      String
+  attempts    Int       @default(0)
+  lockedUntil DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@unique([clinicId, mobile])
+  @@map("otp_logs")
+}
+
+// ─── Audit Log ────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  clinicId   String?
+  userId     String?
+  userRole   String?
+  action     String // e.g. "DOCTOR_VERIFIED", "LOGIN_SUCCESS", "CLINIC_REGISTERED"
+  entityType String? // e.g. "Doctor", "Clinic"
+  entityId   String?
+  meta       Json? // additional context
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@map("audit_logs")
+}
+
+// AyurCare — Prisma Schema ADDITIONS for Phase 2
+// Add these models to prisma/schema.prisma (after existing Patient model)
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum VisitStatus {
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum DoshaType {
+  VATA
+  PITTA
+  KAPHA
+}
+
+enum SignOffSection {
+  PRESCRIPTION
+  DINACHARYA
+  DIET_PLAN
+  TREATMENT_PLAN
+}
+
+enum AIPlanType {
+  PRESCRIPTION
+  DINACHARYA
+  DIET_PLAN
+  TREATMENT_PLAN
+}
+
+enum ObservationStatus {
+  AI_SUGGESTED
+  DOCTOR_CONFIRMED
+  DOCTOR_EDITED
+  DOCTOR_REJECTED
+}
+
+// ─── Visit ────────────────────────────────────────────────────────────────────
+
+model Visit {
+  id               String      @id @default(uuid())
+  clinicId         String
+  patientId        String
+  doctorId         String
+  visitDate        DateTime    @default(now())
+  chiefComplaint      String?
+  medicalHistoryNote  String?
+  examination         String?
+  ayurvedicDiagnosis  String?
+  workingDiagnosis String?
+  status           VisitStatus @default(IN_PROGRESS)
+  notes            String?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  clinic          Clinic           @relation(fields: [clinicId], references: [id])
+  patient         Patient          @relation(fields: [patientId], references: [id])
+  doctor          Doctor           @relation(fields: [doctorId], references: [id])
+  medicalHistory  MedicalHistory?
+  labReports      LabReport[]
+  doshaAssessment DoshaAssessment?
+  tongueAnalysis  TongueAnalysis?
+  eyeAnalysis     EyeAnalysis?
+  aiPlans         AIPlan[]
+  signOffs        SignOff[]
+  chatMessages    ChatMessage[]
+
+  @@map("visits")
+}
+
+// ─── Medical History ──────────────────────────────────────────────────────────
+
+model MedicalHistory {
+  id                 String   @id @default(uuid())
+  patientId          String   @unique
+  visitId            String?  @unique
+  pastIllnesses      String[]
+  surgeries          String[]
+  allergies          String[] // CRITICAL — used in AI safety checks
+  currentMedications String[]
+  familyHistory      String?
+  sleepHours         Float?
+  exerciseFrequency  String?
+  smokingStatus      String? // "never" | "former" | "current"
+  alcoholStatus      String? // "never" | "occasional" | "regular"
+  dietPreference     String? // "vegetarian" | "non-vegetarian" | "vegan"
+  occupation         String?
+  stressLevel        String? // "low" | "medium" | "high"
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  patient Patient @relation(fields: [patientId], references: [id])
+  visit   Visit?  @relation(fields: [visitId], references: [id])
+
+  @@map("medical_histories")
+}
+
+// ─── Lab Report ───────────────────────────────────────────────────────────────
+
+model LabReport {
+  id         String    @id @default(uuid())
+  patientId  String
+  visitId    String?
+  clinicId   String
+  reportType String // "CBC" | "LIPID" | "THYROID" | "URINE" | "IMAGING" | "OTHER"
+  fileName   String
+  s3Key      String
+  mimeType   String
+  reportDate DateTime?
+  notes      String?
+  uploadedAt DateTime  @default(now())
+
+  patient Patient @relation(fields: [patientId], references: [id])
+  visit   Visit?  @relation(fields: [visitId], references: [id])
+
+  @@map("lab_reports")
+}
+
+// ─── Dosha Assessment ─────────────────────────────────────────────────────────
+
+model DoshaAssessment {
+  id            String   @id @default(uuid())
+  visitId       String   @unique
+  patientId     String
+  answers       Json // { questionId: string, answer: string, score: { vata: number, pitta: number, kapha: number } }[]
+  vataScore     Float
+  pittaScore    Float
+  kaphaScore    Float
+  // Doctor override
+  overridden    Boolean  @default(false)
+  overrideNote  String?
+  finalVata     Float // use override values if overridden, else computed
+  finalPitta    Float
+  finalKapha    Float
+  dominantDosha String // "VATA" | "PITTA" | "KAPHA" | "VATA_PITTA" | etc.
+  filledBy      String // "DOCTOR" | "PATIENT"
+  completedAt   DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  visit Visit @relation(fields: [visitId], references: [id])
+
+  @@map("dosha_assessments")
+}
+
+// ─── Tongue Analysis ──────────────────────────────────────────────────────────
+
+model TongueAnalysis {
+  id             String            @id @default(uuid())
+  visitId        String            @unique
+  imageS3Key     String?
+  // Observations
+  colour         String?
+  coating        String?
+  texture        String?
+  cracks         String?
+  moisture       String?
+  shape          String?
+  markings       String?
+  // Status
+  colourStatus   ObservationStatus @default(AI_SUGGESTED)
+  coatingStatus  ObservationStatus @default(AI_SUGGESTED)
+  textureStatus  ObservationStatus @default(AI_SUGGESTED)
+  cracksStatus   ObservationStatus @default(AI_SUGGESTED)
+  moistureStatus ObservationStatus @default(AI_SUGGESTED)
+  // AI raw suggestion
+  aiSuggestion   Json?
+  confirmedAt    DateTime?
+  confirmedBy    String? // doctorId
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  visit Visit @relation(fields: [visitId], references: [id])
+
+  @@map("tongue_analyses")
+}
+
+// ─── Eye Analysis ─────────────────────────────────────────────────────────────
+
+model EyeAnalysis {
+  id                   String            @id @default(uuid())
+  visitId              String            @unique
+  leftImageS3Key       String?
+  rightImageS3Key      String?
+  // Observations
+  colour               String?
+  clarity              String?
+  dryness              String?
+  discolouration       String?
+  luster               String?
+  // Status
+  colourStatus         ObservationStatus @default(AI_SUGGESTED)
+  clarityStatus        ObservationStatus @default(AI_SUGGESTED)
+  drynessStatus        ObservationStatus @default(AI_SUGGESTED)
+  discolourationStatus ObservationStatus @default(AI_SUGGESTED)
+  // AI raw suggestion
+  aiSuggestion         Json?
+  leftAiSuggestion     Json?
+  rightAiSuggestion    Json?
+  confirmedAt          DateTime?
+  confirmedBy          String?
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+
+  visit Visit @relation(fields: [visitId], references: [id])
+
+  @@map("eye_analyses")
+}
+
+// ─── AI Plan (Prescription / Dinacharya / Diet / Treatment) ──────────────────
+
+model AIPlan {
+  id            String     @id @default(uuid())
+  visitId       String
+  planType      AIPlanType
+  // Raw AI generated content
+  aiContent     Json // structured output from Claude
+  // Doctor edited content
+  finalContent  Json? // after doctor edits
+  // Prompt used
+  promptContext Json? // what was sent to AI (for audit)
+  isSignedOff   Boolean    @default(false)
+  signedOffAt   DateTime?
+  signedOffBy   String? // doctorId
+  // Audit
+  aiGeneratedAt DateTime   @default(now())
+  editedAt      DateTime?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  visit Visit @relation(fields: [visitId], references: [id])
+
+  @@unique([visitId, planType])
+  @@map("ai_plans")
+}
+
+// ─── Sign Off ─────────────────────────────────────────────────────────────────
+
+model SignOff {
+  id        String         @id @default(uuid())
+  visitId   String
+  section   SignOffSection
+  doctorId  String
+  signedAt  DateTime       @default(now())
+  ipAddress String?
+
+  visit Visit @relation(fields: [visitId], references: [id])
+
+  @@unique([visitId, section])
+  @@map("sign_offs")
+}
+
+// ─── AI Chat Message ──────────────────────────────────────────────────────────
+
+model ChatMessage {
+  id              String   @id @default(uuid())
+  visitId         String
+  role            String // "doctor" | "assistant"
+  content         String
+  attachmentS3Key String?
+  attachmentType  String?
+  createdAt       DateTime @default(now())
+
+  visit Visit @relation(fields: [visitId], references: [id])
+
+  @@map("chat_messages")
+}
+
+// ─── Dosha Questionnaire Master (32 questions) ───────────────────────────────
+
+model DoshaQuestion {
+  id         String   @id @default(uuid())
+  questionNo Int      @unique
+  category   String // "PHYSICAL" | "PHYSIOLOGICAL" | "PSYCHOLOGICAL"
+  question   String
+  options    Json // [{ label: string, vataScore: number, pittaScore: number, kaphaScore: number }]
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  @@map("dosha_questions")
+}
+
+// ─── Medicine Catalog ─────────────────────────────────────────────────────────
+
+model Medicine {
+  id                String   @id @default(uuid())
+  name              String
+  brandName         String? // "Vaidyaratnam" etc.
+  genericName       String?
+  form              String // "tablet" | "churna" | "taila" | "arishta" | "ghrita" | "kwatha"
+  category          String // "classical" | "proprietary" | "herbal"
+  standardDosage    String?
+  indications       String[]
+  contraindications String[]
+  anupana           String? // vehicle/adjuvant
+  isVaidyaratnam    Boolean  @default(false)
+  mrp               Decimal? @db.Decimal(10, 2)
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@map("medicines")
+}
+
+model PrescriptionTemplate {
+  id          String   @id @default(uuid())
+  clinicId    String
+  doctorId    String
+  name        String
+  medicines   Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("prescription_templates")
+}
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PAID
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  UPI
+  CARD
+  BANK_TRANSFER
+  INSURANCE
+}
+
+model Invoice {
+  id            String        @id @default(uuid())
+  clinicId      String
+  patientId     String
+  visitId       String?
+  invoiceNumber String        @unique
+  status        InvoiceStatus @default(DRAFT)
+  lineItems     Json
+  subtotal      Decimal       @db.Decimal(10, 2)
+  discount      Decimal       @default(0) @db.Decimal(10, 2)
+  tax           Decimal       @default(0) @db.Decimal(10, 2)
+  total         Decimal       @db.Decimal(10, 2)
+  notes         String?
+  dueDate       DateTime?
+  paidAt        DateTime?
+  paymentMethod PaymentMethod?
+  amountPaid    Decimal       @default(0) @db.Decimal(10, 2)
+  paymentRef    String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@map("invoices")
+}
+
+model ServiceCatalog {
+  id          String   @id @default(uuid())
+  clinicId    String
+  name        String
+  description String?
+  category    String
+  price       Decimal  @db.Decimal(10, 2)
+  gstRate     Decimal  @default(0) @db.Decimal(5, 2)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("service_catalog")
+}
+
+model ClinicMedicine {
+  id              String   @id @default(uuid())
+  clinicId        String
+  name            String
+  genericName     String?
+  brandName       String?
+  manufacturer    String?
+  form            String   // tablet/churna/taila/arishta/ghrita/kwatha/capsule/syrup
+  category        String   // classical/proprietary/herbal/mineral
+  unit            String   // strip/bottle/kg/litre/piece
+  purchasePrice   Decimal  @db.Decimal(10, 2)
+  sellingPrice    Decimal  @db.Decimal(10, 2)
+  gstRate         Decimal  @default(0) @db.Decimal(5, 2)
+  stockQty        Decimal  @default(0) @db.Decimal(10, 2)
+  reorderLevel    Decimal  @default(10) @db.Decimal(10, 2)
+  batchNumber     String?
+  expiryDate      DateTime?
+  hsn             String?
+  barcode         String?
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  stockMovements  StockMovement[]
+
+  @@map("clinic_medicines")
+}
+
+enum MovementType {
+  PURCHASE
+  SALE
+  ADJUSTMENT
+  RETURN
+  EXPIRED
+}
+
+model StockMovement {
+  id          String       @id @default(uuid())
+  clinicId    String
+  medicineId  String
+  type        MovementType
+  quantity    Decimal      @db.Decimal(10, 2)
+  balanceAfter Decimal     @db.Decimal(10, 2)
+  invoiceId   String?
+  notes       String?
+  createdAt   DateTime     @default(now())
+
+  medicine    ClinicMedicine @relation(fields: [medicineId], references: [id])
+
+  @@map("stock_movements")
+}
